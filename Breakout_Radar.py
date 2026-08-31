@@ -4,240 +4,146 @@ import aiohttp
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
                              QHeaderView, QProgressBar, QFrame, QPushButton, QSizeGrip)
 from PyQt6.QtCore import pyqtSignal, QThread, Qt, QPoint, QRect, QSize
 from PyQt6.QtGui import QColor, QFont, QCursor, QMouseEvent, QAction
 
-# ==============================================================================
-# CONFIGURACIÓN (SMART MONEY EDITION)
-# ==============================================================================
-CONF = {
-    'MIN_VOL_24H': 15_000_000,   # Subido a 15M para evitar ruido
-    'BLACKLIST': ['USDCUSDT', 'BUSDUSDT', 'TUSDUSDT', 'USDPUSDT', 'FDUSDUSDT'],
-    'REFRESH_RATE': 45,          # Más rápido
-    'MAX_CONCURRENT_REQ': 8,     # Más agresivo
-    'API_WEIGHT_LIMIT': 1100     # Límite Binance es 1200
-}
+from config import RadarConfig
+from data.binance_feed import BinanceDataFeed
+from core.engine import BreakoutScoringEngine
 
 # ==============================================================================
-# CAPA DE DATOS: ARQUITECTURA RADAR + LÓGICA DEZ v3
+# CAPA DE DATOS Y ESCANEO CON BINANCE DATA FEED Y BREAKOUT SCORING ENGINE
 # ==============================================================================
 class AsyncExchange(QThread):
     data_signal = pyqtSignal(list)
     status_signal = pyqtSignal(str)
     weight_signal = pyqtSignal(int)
-    timer_signal = pyqtSignal(str) # Nueva señal para feedback visual de vida
+    timer_signal = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, config: RadarConfig = None):
         super().__init__()
+        self.cfg = config or RadarConfig()
+        self.feed = BinanceDataFeed(self.cfg)
+        self.engine = BreakoutScoringEngine(self.cfg)
         self.running = True
         self.used_weight = 0
-        
-    async def get_json(self, session, url, params=None):
+
+    async def get_ticker_24hr(self, session) -> list:
         try:
-            async with session.get(url, params=params, timeout=8) as resp:
+            url = f"{self.cfg.BINANCE_REST_BASE}/fapi/v1/ticker/24hr"
+            async with session.get(url, timeout=8) as resp:
                 w = resp.headers.get('X-MBX-USED-WEIGHT-1M')
-                if w: 
+                if w:
                     self.used_weight = int(w)
                     self.weight_signal.emit(self.used_weight)
-                
-                if resp.status == 429:
-                    self.status_signal.emit("⚠️ RATELIMIT! PAUSING 60s...")
-                    await asyncio.sleep(60)
-                    return None
-                if resp.status >= 500: return None
-                return await resp.json()
-        except: return None
+                if resp.status == 200:
+                    return await resp.json()
+        except Exception:
+            pass
+        return []
 
-    async def fetch_candles(self, session, symbol):
-        # Usamos 1h para estructura macro (Trend)
-        df_macro = await self.get_json(session, "https://fapi.binance.com/fapi/v1/klines", 
-                                     {'symbol': symbol, 'interval': '1h', 'limit': 48})
-        # Usamos 15m para estructura micro (Power Factor / Squeeze)
-        df_micro = await self.get_json(session, "https://fapi.binance.com/fapi/v1/klines", 
-                                     {'symbol': symbol, 'interval': '15m', 'limit': 24})
-        
-        if not df_macro or not df_micro: return None, None
-        
-        d_ma = pd.DataFrame(df_macro, dtype=float).iloc[:, :6]
-        d_ma.columns = ['ts', 'o', 'h', 'l', 'c', 'v']
-        
-        d_mi = pd.DataFrame(df_micro, dtype=float).iloc[:, :6]
-        d_mi.columns = ['ts', 'o', 'h', 'l', 'c', 'v']
-        
-        return d_ma, d_mi
-
-    async def analyze_ticker(self, session, ticker):
-        """
-        SCIENTIFIC UPGRADE: Detección de Transición de Fase (Compresión -> Expansión).
-        Busca anomalías estadísticas (Z-Score) en volumen sobre estructuras de baja volatilidad.
-        """
-        symbol = ticker['symbol']
+    async def analyze_symbol(self, symbol: str, ticker_info: dict) -> dict:
         try:
-            vol_24h = float(ticker['quoteVolume'])
-            pct_24h = float(ticker['priceChangePercent'])
-            last_price = float(ticker['lastPrice'])
-        except: return None
+            df_fast = await self.feed.fetch_historical_klines(symbol, interval=self.cfg.TIMEFRAME_FAST, limit=self.cfg.LOOKBACK_PERIODS + 10)
+            if df_fast.empty or len(df_fast) < self.cfg.LOOKBACK_PERIODS:
+                return None
 
-        # Filtros básicos
-        if vol_24h < CONF['MIN_VOL_24H'] or symbol in CONF['BLACKLIST']: return None
-        if "USDT" not in symbol: return None
+            eval_res = self.engine.evaluate_symbol(symbol, df_fast, historical_oi=[])
+            if not eval_res or eval_res.get("score", 0) <= 0:
+                return None
 
-        # Fetch Profundo
-        df_macro, df_micro = await self.fetch_candles(session, symbol)
-        if df_macro is None: return None
+            last_price = float(df_fast['close'].iloc[-1])
+            vol_m = float(ticker_info.get('quoteVolume', 0)) / 1_000_000 if ticker_info else float(df_fast['volume'].iloc[-24:].sum() * last_price) / 1_000_000
+            change_24h = float(ticker_info.get('priceChangePercent', 0)) if ticker_info else 0.0
 
-        score = 0.0
-        details = []
+            flags = eval_res.get("flags", [])
+            details_str = " ".join(flags)
 
-        # --- 1. VOLUME Z-SCORE (Anomalía Estadística) ---
-        # Si el volumen es viejo, no sirve.
-        vol_recent = df_macro['v'].iloc[-4:].sum()
-        vol_total = df_macro['v'].sum()
-        freshness = (vol_recent / (vol_total + 1e-9)) * 100
-        
-        if freshness < 10: return None # Descartar zombies
-        
-        # Calculamos si el volumen actual es una anomalía estadística (Z-Score > 2)
-        vols = df_macro['v'].values
-        vol_mean = np.mean(vols)
-        vol_std = np.std(vols)
-        vol_z = (vols[-1] - vol_mean) / (vol_std + 1e-9)
-        
-        if vol_z > 3.0: score += 25; details.append("VOL_SPIKE")
-        elif vol_z > 1.5: score += 10
-
-        # --- 2. VOLATILITY COMPRESSION (La Energía Potencial) ---
-        # Usamos Bollinger Band Width (BBW) normalizado para detectar el "Squeeze" antes del disparo
-        closes_macro = df_macro['c'].values
-        bb_std = np.std(closes_macro[-20:]) 
-        bb_ma = np.mean(closes_macro[-20:])
-        bbw = (4 * bb_std) / bb_ma # Ancho de banda relativo
-        
-        # Si la volatilidad histórica es extremadamente baja (< 2%), el movimiento será violento
-        if bbw < 0.03: 
-            score += 20
-            details.append("COILED") # Resorte comprimido
-
-        # --- 3. MICRO-STRUCTURE BREAKOUT (15m) ---
-        last_candle = df_micro.iloc[-2] # Penúltima (cerrada)
-        curr_candle = df_micro.iloc[-1] # Actual (en formación)
-        
-        price_move_pct = abs((curr_candle['c'] - curr_candle['o']) / curr_candle['o'] * 100)
-        
-        # Power Candle: Cuerpo grande sin mechas
-        upper_wick = (curr_candle['h'] - max(curr_candle['c'], curr_candle['o']))
-        total_len = (curr_candle['h'] - curr_candle['l'])
-        body_len = abs(curr_candle['c'] - curr_candle['o'])
-        
-        if total_len > 0:
-            if (body_len / total_len) > 0.7 and price_move_pct > 0.5:
-                score += 15
-                details.append("MOMENTUM")
-            elif (upper_wick / total_len) > 0.6: 
-                score -= 30 # Rechazo/Venta fuerte
-
-        # --- 4. TREND ALIGNMENT (SMA 1H) ---
-        sma7 = np.mean(closes_macro[-7:])
-        sma25 = np.mean(closes_macro[-25:])
-        
-        if sma7 > sma25:
-            score += 15 # Tendencia alcista
-            if last_price > df_macro['h'].max() * 0.99: # Cerca del máximo
-                score += 10
-                details.append("ATH_NEAR")
-        else:
-            if pct_24h > 5.0: score -= 10 # Reversión contra tendencia (peligroso)
-
-        # --- 5. OPEN INTEREST (Solo para candidatos TOP) ---
-        # Optimizamos API: Solo chequeamos OI si el score ya promete (>30)
-        oi_change = 0.0
-        if score > 30:
-            try:
-                oi_data = await self.get_json(session, "https://fapi.binance.com/fapi/v1/openInterest", {'symbol': symbol})
-                if oi_data:
-                    # No podemos calcular cambio real sin historial, pero validamos que exista OI sustancial
-                    oi_val = float(oi_data['openInterest'])
-                    if oi_val > 0: score += 10 # Bonificación por tener mercado de futuros activo
-            except: pass
-
-        # Normalización final
-        score = max(0, min(100, score))
-
-        return {
-            'symbol': symbol,
-            'price': last_price,
-            'change': pct_24h,
-            'vol_m': vol_24h / 1_000_000,
-            'score': score,
-            'details': " ".join(details)
-        }
+            return {
+                'symbol': symbol,
+                'direction': eval_res.get("direction", "NEUTRAL"),
+                'price': last_price,
+                'change': change_24h,
+                'vol_m': vol_m,
+                'score': eval_res.get("score", 0),
+                'details': details_str
+            }
+        except Exception:
+            return None
 
     async def run_loop(self):
-        # Sesión persistente para evitar fugas de memoria y sockets
-        async with aiohttp.ClientSession() as session:
-            while self.running:
-                try:
-                    # 1. Chequeo de Salud API
-                    if self.used_weight > CONF['API_WEIGHT_LIMIT']:
-                        self.status_signal.emit(f"⏳ API COOLING ({self.used_weight})...")
-                        await asyncio.sleep(10)
-                        continue
-
-                    self.status_signal.emit("🔍 GLOBAL SCAN IN PROGRESS...")
-                    
-                    # 2. Ingesta Global
-                    tickers = await self.get_json(session, "https://fapi.binance.com/fapi/v1/ticker/24hr")
-                    if not tickers:
-                        await asyncio.sleep(5); continue
-
-                    # 3. Pre-filtro (Optimizado)
-                    candidates = []
-                    for t in tickers:
-                        try:
-                            v = float(t['quoteVolume'])
-                            # Solo analizamos activos con liquidez real para evitar trampas
-                            if v > CONF['MIN_VOL_24H']: candidates.append(t)
-                        except: continue
-                    
-                    # Ordenar por 'Interés' (Volatilidad * Volumen)
-                    candidates.sort(key=lambda x: float(x['quoteVolume']) * abs(float(x['priceChangePercent'])), reverse=True)
-                    target_candidates = candidates[:40] # Analizamos Top 40
-
-                    self.status_signal.emit(f"🔬 COMPUTING METRICS ON {len(target_candidates)} ASSETS...")
-                    
-                    results = []
-                    sem = asyncio.Semaphore(CONF['MAX_CONCURRENT_REQ'])
-
-                    async def bound_analyze(t):
-                        async with sem: return await self.analyze_ticker(session, t)
-
-                    tasks = [bound_analyze(t) for t in target_candidates]
-                    for f in asyncio.as_completed(tasks):
-                        res = await f
-                        if res and res['score'] > 25: # Umbral de calidad mínima
-                            results.append(res)
-                    
-                    # Ordenar por Probabilidad de Breakout (Score)
-                    results.sort(key=lambda x: x['score'], reverse=True)
-                    
-                    self.data_signal.emit(results)
-                    self.status_signal.emit(f"✅ FOUND {len(results)} OPPORTUNITIES")
-              
-                except Exception as e:
-                    self.status_signal.emit(f"⚠️ NETWORK ERROR: {str(e)} - RETRYING...")
+        await self.feed.initialize()
+        while self.running:
+            try:
+                self.status_signal.emit("🔍 FETCHING ACTIVE USDT PAIRS...")
+                symbols = await self.feed.fetch_active_usdt_pairs()
+                if not symbols:
                     await asyncio.sleep(5)
-                
-                # Smart Sleep con Feedback Visual
-                for i in range(CONF['REFRESH_RATE'], 0, -1):
-                    if not self.running: break
-                    self.timer_signal.emit(f"NEXT SCAN: {i}s")
-                    await asyncio.sleep(1)
+                    continue
 
-    def run(self): asyncio.run(self.run_loop())
-    def stop(self): self.running = False
+                self.status_signal.emit("🔍 GLOBAL SCAN IN PROGRESS...")
+                tickers = await self.get_ticker_24hr(self.feed.session)
+                ticker_map = {t['symbol']: t for t in tickers if isinstance(t, dict) and 'symbol' in t}
+
+                # Sort symbols by liquidity / volume
+                filtered_symbols = []
+                for s in symbols:
+                    t = ticker_map.get(s)
+                    if t:
+                        try:
+                            v = float(t.get('quoteVolume', 0))
+                            if v > 15_000_000:
+                                filtered_symbols.append((s, v * abs(float(t.get('priceChangePercent', 0)))))
+                        except Exception:
+                            continue
+                    else:
+                        filtered_symbols.append((s, 0))
+
+                filtered_symbols.sort(key=lambda x: x[1], reverse=True)
+                target_symbols = [s[0] for s in filtered_symbols[:40]] if filtered_symbols else symbols[:40]
+
+                self.status_signal.emit(f"🔬 COMPUTING METRICS ON {len(target_symbols)} ASSETS...")
+
+                sem = asyncio.Semaphore(self.cfg.MAX_CONCURRENT_REQUESTS)
+
+                async def bound_analyze(s):
+                    async with sem:
+                        return await self.analyze_symbol(s, ticker_map.get(s))
+
+                tasks = [bound_analyze(s) for s in target_symbols]
+                results = []
+                for f in asyncio.as_completed(tasks):
+                    res = await f
+                    if res and res['score'] > 25 and res['direction'] in ['LONG', 'SHORT']:
+                        results.append(res)
+
+                results.sort(key=lambda x: x['score'], reverse=True)
+
+                self.data_signal.emit(results)
+                self.status_signal.emit(f"✅ FOUND {len(results)} OPPORTUNITIES")
+
+            except Exception as e:
+                self.status_signal.emit(f"⚠️ NETWORK ERROR: {str(e)} - RETRYING...")
+                await asyncio.sleep(5)
+
+            # Refresh Countdown
+            for i in range(45, 0, -1):
+                if not self.running:
+                    break
+                self.timer_signal.emit(f"NEXT SCAN: {i}s")
+                await asyncio.sleep(1)
+
+        await self.feed.close()
+
+    def run(self):
+        asyncio.run(self.run_loop())
+
+    def stop(self):
+        self.running = False
+
 
 # ==============================================================================
 # UI (VISUALIZACIÓN TÁCTICA - FRAMELESS & RESIZABLE)
@@ -253,10 +159,10 @@ class ModernTitleBar(QWidget):
         # Title / Logo area
         self.title_lbl = QLabel("VECTOR /// RADAR")
         self.title_lbl.setStyleSheet("""
-            color: #00F0FF; 
-            font-family: 'Segoe UI'; 
-            font-weight: 900; 
-            font-size: 12px; 
+            color: #00F0FF;
+            font-family: 'Segoe UI';
+            font-weight: 900;
+            font-size: 12px;
             letter-spacing: 2px;
         """)
         self.layout.addWidget(self.title_lbl)
@@ -267,10 +173,10 @@ class ModernTitleBar(QWidget):
         self.status_lbl.setStyleSheet("color: #666; font-size: 10px; padding-right: 15px;")
         self.layout.addWidget(self.status_lbl)
 
-        # Timer Label (Nueva adición)
+        # Timer Label
         self.timer_lbl = QLabel("")
         self.timer_lbl.setStyleSheet("color: #00F0FF; font-size: 10px; font-weight: bold; padding-right: 10px;")
-        self.layout.insertWidget(2, self.timer_lbl) # Insertar antes del status
+        self.layout.insertWidget(2, self.timer_lbl)
 
         # Window Controls
         btn_style = """
@@ -295,7 +201,6 @@ class ModernTitleBar(QWidget):
         self.layout.addWidget(self.btn_min)
         self.layout.addWidget(self.btn_close)
 
-        # Draggable Logic
         self.start_pos = None
 
     def mousePressEvent(self, event):
@@ -311,20 +216,19 @@ class ModernTitleBar(QWidget):
     def mouseReleaseEvent(self, event):
         self.start_pos = None
 
+
 class BreakoutMonitor(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.resize(650, 850)
-        
-        # Variables de redimensionado
+        self.resize(720, 850)
+
         self.grip_size = 10
         self.resizing = False
         self.resize_edge = None
         self.old_pos = None
-        
-        # Styles
+
         self.setStyleSheet("""
             QMainWindow { background-color: #0b0e11; border: 1px solid #1e2329; }
             QTableWidget { background-color: #0b0e11; color: #eaecef; gridline-color: #1e2329; border: none; font-family: 'Consolas', monospace; }
@@ -334,16 +238,15 @@ class BreakoutMonitor(QMainWindow):
             QProgressBar::chunk { background-color: #00F0FF; }
         """)
 
-        # Main Layout Wrapper
         self.central_widget = QWidget()
         self.central_widget.setStyleSheet("background-color: #0b0e11; border: 1px solid #2b3139;")
         self.setCentralWidget(self.central_widget)
-        
+
         self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(1, 1, 1, 1) # Borde para ver el outline
+        self.main_layout.setContentsMargins(1, 1, 1, 1)
         self.main_layout.setSpacing(0)
 
-        # 1. Custom Title Bar
+        # 1. Title Bar
         self.title_bar = ModernTitleBar(self)
         self.main_layout.addWidget(self.title_bar)
 
@@ -352,28 +255,27 @@ class BreakoutMonitor(QMainWindow):
         content_layout.setContentsMargins(10, 10, 10, 10)
         content_layout.setSpacing(10)
 
-        # API Weight Bar
         self.api_bar = QProgressBar()
         self.api_bar.setRange(0, 1200)
         content_layout.addWidget(self.api_bar)
 
-        # Table
+        # Table with 7 columns including Direction
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["ASSET", "PRICE", "24h %", "VOL (M)", "SIGNAL", "SCORE"])
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["ASSET", "DIR", "PRICE", "24h %", "VOL (M)", "SIGNAL", "SCORE"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setShowGrid(False)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        
-        # Header setup
+
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+
         content_layout.addWidget(self.table)
-        
+
         # Legend
         legend = QLabel("■ >80: SNIPER ENTRY   ■ >60: WATCHLIST   ■ <60: NO TRADE")
         legend.setStyleSheet("color: #444; font-size: 9px; font-family: 'Segoe UI'; font-weight: bold; letter-spacing: 1px;")
@@ -382,7 +284,6 @@ class BreakoutMonitor(QMainWindow):
 
         self.main_layout.addLayout(content_layout)
 
-        # Habilitar tracking del mouse para cambiar el cursor en los bordes
         self.setMouseTracking(True)
         self.central_widget.setMouseTracking(True)
 
@@ -391,7 +292,7 @@ class BreakoutMonitor(QMainWindow):
         self.scanner.data_signal.connect(self.update_table)
         self.scanner.status_signal.connect(self.title_bar.status_lbl.setText)
         self.scanner.weight_signal.connect(self.update_weight)
-        self.scanner.timer_signal.connect(self.title_bar.timer_lbl.setText) # Conectar Timer
+        self.scanner.timer_signal.connect(self.title_bar.timer_lbl.setText)
         self.scanner.start()
 
     def update_weight(self, w):
@@ -404,53 +305,75 @@ class BreakoutMonitor(QMainWindow):
         for i, row in enumerate(data):
             font_main = QFont("Segoe UI", 9, QFont.Weight.Bold)
             font_num = QFont("Consolas", 9)
-            
-            sym = QTableWidgetItem(row['symbol'].replace("USDT",""))
+
+            # Asset
+            sym = QTableWidgetItem(row['symbol'].replace("USDT", ""))
             sym.setFont(font_main)
             sym.setForeground(QColor("#eaecef"))
             self.table.setItem(i, 0, sym)
-            
+
+            # Direction
+            direction = row.get('direction', 'NEUTRAL')
+            dir_item = QTableWidgetItem(direction)
+            dir_item.setFont(font_main)
+            dir_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if direction == "LONG":
+                dir_item.setForeground(QColor("#0ecb81")) # Green
+            elif direction == "SHORT":
+                dir_item.setForeground(QColor("#f6465d")) # Red
+            else:
+                dir_item.setForeground(QColor("#848e9c"))
+            self.table.setItem(i, 1, dir_item)
+
+            # Price
             p_val = f"{row['price']:.4f}" if row['price'] < 10 else f"{row['price']:.2f}"
             price = QTableWidgetItem(p_val)
             price.setFont(font_num)
             price.setForeground(QColor("#b7bdc6"))
-            self.table.setItem(i, 1, price)
-            
+            self.table.setItem(i, 2, price)
+
+            # 24h %
             pct = row['change']
             change = QTableWidgetItem(f"{pct:+.2f}%")
             change.setFont(font_num)
             c_color = "#0ecb81" if pct > 0 else "#f6465d"
             change.setForeground(QColor(c_color))
-            self.table.setItem(i, 2, change)
-            
+            self.table.setItem(i, 3, change)
+
+            # Vol (M)
             vol = QTableWidgetItem(f"{row['vol_m']:.1f}M")
             vol.setFont(font_num)
             vol.setForeground(QColor("#848e9c"))
-            self.table.setItem(i, 3, vol)
-            
+            self.table.setItem(i, 4, vol)
+
+            # Signal/Flags
             dets = row['details']
             flags = QTableWidgetItem(dets)
             flags.setFont(QFont("Segoe UI", 8))
-            if "COILED" in dets: flags.setForeground(QColor("#FF00FF")) # Magenta para alta tensión
-            elif "VOL_SPIKE" in dets: flags.setForeground(QColor("#00F0FF")) # Cyan para volumen
-            elif "MOMENTUM" in dets: flags.setForeground(QColor("#0ecb81")) # Verde para fuerza
-            else: flags.setForeground(QColor("#5E6673"))
-            self.table.setItem(i, 4, flags)
-            
+            if "COILED" in dets:
+                flags.setForeground(QColor("#FF00FF"))
+            elif "VOL_SPIKE" in dets:
+                flags.setForeground(QColor("#00F0FF"))
+            elif "STRONG_BODY" in dets:
+                flags.setForeground(QColor("#0ecb81"))
+            else:
+                flags.setForeground(QColor("#5E6673"))
+            self.table.setItem(i, 5, flags)
+
+            # Score
             sc = row['score']
             s_item = QTableWidgetItem(f"{sc:.0f}")
             s_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             s_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Black))
-            if sc >= 80: 
+            if sc >= 80:
                 s_item.setForeground(QColor("#00F0FF"))
                 s_item.setBackground(QColor(0, 240, 255, 25))
             elif sc >= 60:
                 s_item.setForeground(QColor("#0ecb81"))
             else:
                 s_item.setForeground(QColor("#444"))
-            self.table.setItem(i, 5, s_item)
+            self.table.setItem(i, 6, s_item)
 
-    # --- LÓGICA DE REDIMENSIONADO ESTABLE (PYTHON PURO) ---
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             edge = self._check_edge(event.pos())
@@ -465,11 +388,10 @@ class BreakoutMonitor(QMainWindow):
             self._resize_window(delta)
             self.old_pos = event.globalPosition().toPoint()
         else:
-            # Cambiar cursor según posición
             edge = self._check_edge(event.pos())
-            if edge == "right" or edge == "left":
+            if edge in ("right", "left"):
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
-            elif edge == "bottom" or edge == "top":
+            elif edge in ("bottom", "top"):
                 self.setCursor(Qt.CursorShape.SizeVerCursor)
             elif edge == "bottom_right":
                 self.setCursor(Qt.CursorShape.SizeFDiagCursor)
@@ -482,7 +404,6 @@ class BreakoutMonitor(QMainWindow):
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _check_edge(self, pos):
-        # Detectar si el mouse está en los bordes
         r = self.rect()
         m = self.grip_size
         x, y, w, h = pos.x(), pos.y(), r.width(), r.height()
@@ -505,8 +426,7 @@ class BreakoutMonitor(QMainWindow):
             geo.setHeight(geo.height() + delta.y())
         elif self.resize_edge == "left":
             geo.setLeft(geo.left() + delta.x())
-        
-        # Mínimos
+
         if geo.width() > 300 and geo.height() > 300:
             self.setGeometry(geo)
 
@@ -514,6 +434,7 @@ class BreakoutMonitor(QMainWindow):
         self.scanner.stop()
         self.scanner.wait()
         e.accept()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
