@@ -1,41 +1,41 @@
-from dataclasses import dataclass
-from typing import Tuple
+"""Breakout Radar - Quantitative Core & Regime Parameters."""
 
-@dataclass(frozen=True)
-class RadarConfig:
-    # API Endpoints
-    BINANCE_REST_BASE: str = "https://fapi.binance.com"
-    BINANCE_WS_BASE: str = "wss://fstream.binance.com/ws"
+# Network & Engine
+BASE_URL = "https://fapi.binance.com"
+SCAN_INTERVAL = 45  # Seconds
+MAX_CONCURRENT_REQUESTS = 10
+RATE_LIMIT_CEILING = 1000
+BENCHMARK_SYMBOL = "BTCUSDT"
 
-    # Timeframes & Lookbacks
-    TIMEFRAME_FAST: str = "15m"
-    TIMEFRAME_SLOW: str = "1h"
-    LOOKBACK_PERIODS: int = 48
-    SMA_FAST: int = 7
-    SMA_SLOW: int = 25
+# Volume Diurnal Seasonality
+VOLUME_LOOKBACK_HOURS = 168  # 7 days of 1h candles for hourly diurnal profile
+VOLUME_MIN_STD_EPSILON = 1e-6
 
-    # Volatility Squeeze (Bollinger Bands)
-    BB_PERIOD: int = 20
-    BB_STD: float = 2.0
-    BBW_COMPRESSION_THRESHOLD: float = 0.035
+# Carter Squeeze & Volatility Parameters
+BB_LENGTH = 20
+BB_MULT = 2.0
+KC_MULT = 1.5
+ATR_PERIOD = 20
+BBW_PERCENTILE_WINDOW = 120  # Percentile lookback window
+BBW_COMPRESSION_PERCENTILE = 20.0  # Lowest 20% of historical BBW
 
-    # Volume & Order Flow Thresholds
-    VOL_ZSCORE_TRIGGER: float = 2.5
-    DELTA_OI_THRESHOLD_PCT: float = 2.0  # +2% increase in OI during breakout
-    CANDLE_BODY_MIN_RATIO: float = 0.65  # Min body to range ratio
-    MAX_REJECTION_WICK_RATIO: float = 0.25 # Max opposing wick ratio
+# Order Flow & Open Interest Regimes
+OI_CHANGE_LOOKBACK = 4  # 4 * 15m = 1 hour delta
+OI_AGGRESSIVE_EXPANSION_THRESHOLD = 0.02  # +2.0% delta OI
 
-    # Scoring Weights (Total = 100)
-    WEIGHT_COMPRESSION: int = 25
-    WEIGHT_VOL_SPIKE: int = 30
-    WEIGHT_DELTA_OI: int = 20
-    WEIGHT_CANDLE_QUALITY: int = 15
-    WEIGHT_TREND_ALIGNMENT: int = 10
+# Calibrated Logistic Weights for Probability Engine: σ(w0 + Σ w_i * X_i)
+LOGISTIC_BIAS = -2.10
+MODEL_WEIGHTS = {
+    "diurnal_vol_zscore": 0.85,    # Standardized diurnal volume spike
+    "squeeze_compression": 1.20,   # Bollinger inside Keltner state
+    "squeeze_fire": 1.50,          # First candle breaking out of squeeze
+    "oi_expansion_regime": 1.35,   # ΔOI > 0 with positive price momentum
+    "relative_strength_alpha": 1.10,# Residual return vs BTC beta
+    "power_candle_ratio": 0.90,    # >70% candle body ratio
+    "rejection_penalty": -2.20     # >60% upper wick rejection
+}
 
-    # Score Tiers
-    SCORE_SNIPER: int = 80
-    SCORE_WATCHLIST: int = 60
-
-    # Network & Engine
-    MAX_CONCURRENT_REQUESTS: int = 20
-    WS_RECONNECT_MAX_BACKOFF: int = 60
+# UI Display Thresholds
+DISPLAY_MIN_PROBABILITY = 30.0  # Minimum % probability to display
+SNIPER_PROBABILITY_THRESHOLD = 75.0
+WATCHLIST_PROBABILITY_THRESHOLD = 55.0

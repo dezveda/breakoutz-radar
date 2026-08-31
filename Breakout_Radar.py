@@ -10,12 +10,11 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import pyqtSignal, QThread, Qt, QPoint, QRect, QSize
 from PyQt6.QtGui import QColor, QFont, QCursor, QMouseEvent, QAction
 
-from config import RadarConfig
-from data.binance_feed import BinanceDataFeed
-from core.engine import BreakoutScoringEngine
+import config
+from core.scanner import MarketScanner
 
 # ==============================================================================
-# CAPA DE DATOS Y ESCANEO CON BINANCE DATA FEED Y BREAKOUT SCORING ENGINE
+# DATA ENGINE AND SCANNER THREAD
 # ==============================================================================
 class AsyncExchange(QThread):
     data_signal = pyqtSignal(list)
@@ -23,17 +22,14 @@ class AsyncExchange(QThread):
     weight_signal = pyqtSignal(int)
     timer_signal = pyqtSignal(str)
 
-    def __init__(self, config: RadarConfig = None):
+    def __init__(self):
         super().__init__()
-        self.cfg = config or RadarConfig()
-        self.feed = BinanceDataFeed(self.cfg)
-        self.engine = BreakoutScoringEngine(self.cfg)
         self.running = True
         self.used_weight = 0
 
     async def get_ticker_24hr(self, session) -> list:
         try:
-            url = f"{self.cfg.BINANCE_REST_BASE}/fapi/v1/ticker/24hr"
+            url = f"{config.BASE_URL}/fapi/v1/ticker/24hr"
             async with session.get(url, timeout=8) as resp:
                 w = resp.headers.get('X-MBX-USED-WEIGHT-1M')
                 if w:
@@ -45,98 +41,87 @@ class AsyncExchange(QThread):
             pass
         return []
 
-    async def analyze_symbol(self, symbol: str, ticker_info: dict) -> dict:
+    async def fetch_active_usdt_pairs(self, session) -> list:
+        url = f"{config.BASE_URL}/fapi/v1/exchangeInfo"
         try:
-            df_fast = await self.feed.fetch_historical_klines(symbol, interval=self.cfg.TIMEFRAME_FAST, limit=self.cfg.LOOKBACK_PERIODS + 10)
-            if df_fast.empty or len(df_fast) < self.cfg.LOOKBACK_PERIODS:
-                return None
-
-            eval_res = self.engine.evaluate_symbol(symbol, df_fast, historical_oi=[])
-            if not eval_res or eval_res.get("score", 0) <= 0:
-                return None
-
-            last_price = float(df_fast['close'].iloc[-1])
-            vol_m = float(ticker_info.get('quoteVolume', 0)) / 1_000_000 if ticker_info else float(df_fast['volume'].iloc[-24:].sum() * last_price) / 1_000_000
-            change_24h = float(ticker_info.get('priceChangePercent', 0)) if ticker_info else 0.0
-
-            flags = eval_res.get("flags", [])
-            details_str = " ".join(flags)
-
-            return {
-                'symbol': symbol,
-                'direction': eval_res.get("direction", "NEUTRAL"),
-                'price': last_price,
-                'change': change_24h,
-                'vol_m': vol_m,
-                'score': eval_res.get("score", 0),
-                'details': details_str
-            }
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return [
+                        s["symbol"] for s in data.get("symbols", [])
+                        if s["contractType"] == "PERPETUAL"
+                        and s["quoteAsset"] == "USDT"
+                        and s["status"] == "TRADING"
+                    ]
         except Exception:
-            return None
+            pass
+        return []
 
     async def run_loop(self):
-        await self.feed.initialize()
-        while self.running:
-            try:
-                self.status_signal.emit("🔍 FETCHING ACTIVE USDT PAIRS...")
-                symbols = await self.feed.fetch_active_usdt_pairs()
-                if not symbols:
+        async with aiohttp.ClientSession(headers={"User-Agent": "BreakoutRadar/2.0"}) as session:
+            scanner = MarketScanner(session)
+            while self.running:
+                try:
+                    self.status_signal.emit("📊 UPDATING BTC BENCHMARK METRICS...")
+                    await scanner.update_benchmark_cache()
+
+                    self.status_signal.emit("🔍 FETCHING ACTIVE USDT PAIRS...")
+                    symbols = await self.fetch_active_usdt_pairs(session)
+                    if not symbols:
+                        await asyncio.sleep(5)
+                        continue
+
+                    self.status_signal.emit("🔍 GLOBAL SCAN IN PROGRESS...")
+                    tickers = await self.get_ticker_24hr(session)
+                    ticker_map = {t['symbol']: t for t in tickers if isinstance(t, dict) and 'symbol' in t}
+
+                    # Filter top liquid pairs
+                    filtered_symbols = []
+                    for s in symbols:
+                        t = ticker_map.get(s)
+                        if t:
+                            try:
+                                v = float(t.get('quoteVolume', 0))
+                                if v > 10_000_000:
+                                    filtered_symbols.append((s, v * abs(float(t.get('priceChangePercent', 0)))))
+                            except Exception:
+                                continue
+                        else:
+                            filtered_symbols.append((s, 0))
+
+                    filtered_symbols.sort(key=lambda x: x[1], reverse=True)
+                    target_symbols = [s[0] for s in filtered_symbols[:40]] if filtered_symbols else symbols[:40]
+
+                    self.status_signal.emit(f"🔬 QUANT ANALYSIS ON {len(target_symbols)} ASSETS...")
+
+                    sem = asyncio.Semaphore(config.MAX_CONCURRENT_REQUESTS)
+
+                    async def bound_evaluate(s):
+                        async with sem:
+                            return await scanner.evaluate_symbol(s, ticker_map.get(s, {}))
+
+                    tasks = [bound_evaluate(s) for s in target_symbols]
+                    results = []
+                    for f in asyncio.as_completed(tasks):
+                        res = await f
+                        if res is not None and res.get("probability", 0) >= config.DISPLAY_MIN_PROBABILITY:
+                            results.append(res)
+
+                    results.sort(key=lambda x: x["probability"], reverse=True)
+
+                    self.data_signal.emit(results)
+                    self.status_signal.emit(f"✅ FOUND {len(results)} QUALIFIED OPPORTUNITIES")
+
+                except Exception as e:
+                    self.status_signal.emit(f"⚠️ NETWORK ERROR: {str(e)} - RETRYING...")
                     await asyncio.sleep(5)
-                    continue
 
-                self.status_signal.emit("🔍 GLOBAL SCAN IN PROGRESS...")
-                tickers = await self.get_ticker_24hr(self.feed.session)
-                ticker_map = {t['symbol']: t for t in tickers if isinstance(t, dict) and 'symbol' in t}
-
-                # Sort symbols by liquidity / volume
-                filtered_symbols = []
-                for s in symbols:
-                    t = ticker_map.get(s)
-                    if t:
-                        try:
-                            v = float(t.get('quoteVolume', 0))
-                            if v > 15_000_000:
-                                filtered_symbols.append((s, v * abs(float(t.get('priceChangePercent', 0)))))
-                        except Exception:
-                            continue
-                    else:
-                        filtered_symbols.append((s, 0))
-
-                filtered_symbols.sort(key=lambda x: x[1], reverse=True)
-                target_symbols = [s[0] for s in filtered_symbols[:40]] if filtered_symbols else symbols[:40]
-
-                self.status_signal.emit(f"🔬 COMPUTING METRICS ON {len(target_symbols)} ASSETS...")
-
-                sem = asyncio.Semaphore(self.cfg.MAX_CONCURRENT_REQUESTS)
-
-                async def bound_analyze(s):
-                    async with sem:
-                        return await self.analyze_symbol(s, ticker_map.get(s))
-
-                tasks = [bound_analyze(s) for s in target_symbols]
-                results = []
-                for f in asyncio.as_completed(tasks):
-                    res = await f
-                    if res and res['score'] > 25 and res['direction'] in ['LONG', 'SHORT']:
-                        results.append(res)
-
-                results.sort(key=lambda x: x['score'], reverse=True)
-
-                self.data_signal.emit(results)
-                self.status_signal.emit(f"✅ FOUND {len(results)} OPPORTUNITIES")
-
-            except Exception as e:
-                self.status_signal.emit(f"⚠️ NETWORK ERROR: {str(e)} - RETRYING...")
-                await asyncio.sleep(5)
-
-            # Refresh Countdown
-            for i in range(45, 0, -1):
-                if not self.running:
-                    break
-                self.timer_signal.emit(f"NEXT SCAN: {i}s")
-                await asyncio.sleep(1)
-
-        await self.feed.close()
+                # Refresh Countdown
+                for i in range(config.SCAN_INTERVAL, 0, -1):
+                    if not self.running:
+                        break
+                    self.timer_signal.emit(f"NEXT SCAN: {i}s")
+                    await asyncio.sleep(1)
 
     def run(self):
         asyncio.run(self.run_loop())
@@ -146,7 +131,7 @@ class AsyncExchange(QThread):
 
 
 # ==============================================================================
-# UI (VISUALIZACIÓN TÁCTICA - FRAMELESS & RESIZABLE)
+# UI (VISUALIZACIÓN TÁCTICA QUANT - FRAMELESS & RESIZABLE)
 # ==============================================================================
 class ModernTitleBar(QWidget):
     def __init__(self, parent=None):
@@ -157,7 +142,7 @@ class ModernTitleBar(QWidget):
         self.layout.setSpacing(0)
 
         # Title / Logo area
-        self.title_lbl = QLabel("VECTOR /// RADAR")
+        self.title_lbl = QLabel("QUANT /// BREAKOUT RADAR")
         self.title_lbl.setStyleSheet("""
             color: #00F0FF;
             font-family: 'Segoe UI';
@@ -217,12 +202,12 @@ class ModernTitleBar(QWidget):
         self.start_pos = None
 
 
-class BreakoutMonitor(QMainWindow):
+class BreakoutRadarWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.resize(720, 850)
+        self.resize(800, 850)
 
         self.grip_size = 10
         self.resizing = False
@@ -256,13 +241,13 @@ class BreakoutMonitor(QMainWindow):
         content_layout.setSpacing(10)
 
         self.api_bar = QProgressBar()
-        self.api_bar.setRange(0, 1200)
+        self.api_bar.setRange(0, config.RATE_LIMIT_CEILING)
         content_layout.addWidget(self.api_bar)
 
-        # Table with 7 columns including Direction
+        # Table with 6 Quantitative columns
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["ASSET", "DIR", "PRICE", "24h %", "VOL (M)", "SIGNAL", "SCORE"])
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["SYMBOL", "PRICE", "PROB %", "OI REGIME", "ALPHA / DIURNAL Z", "FLAGS / CONFLUENCE"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setShowGrid(False)
@@ -271,13 +256,15 @@ class BreakoutMonitor(QMainWindow):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
 
         content_layout.addWidget(self.table)
 
         # Legend
-        legend = QLabel("■ >80: SNIPER ENTRY   ■ >60: WATCHLIST   ■ <60: NO TRADE")
+        legend = QLabel("■ >75%: SNIPER ALPHA   ■ >55%: MOMENTUM WATCHLIST   ■ <55%: ACCUMULATION / EARLY")
         legend.setStyleSheet("color: #444; font-size: 9px; font-family: 'Segoe UI'; font-weight: bold; letter-spacing: 1px;")
         legend.setAlignment(Qt.AlignmentFlag.AlignCenter)
         content_layout.addWidget(legend)
@@ -289,7 +276,7 @@ class BreakoutMonitor(QMainWindow):
 
         # Logic Thread
         self.scanner = AsyncExchange()
-        self.scanner.data_signal.connect(self.update_table)
+        self.scanner.data_signal.connect(self.update_table_view)
         self.scanner.status_signal.connect(self.title_bar.status_lbl.setText)
         self.scanner.weight_signal.connect(self.update_weight)
         self.scanner.timer_signal.connect(self.title_bar.timer_lbl.setText)
@@ -297,82 +284,65 @@ class BreakoutMonitor(QMainWindow):
 
     def update_weight(self, w):
         self.api_bar.setValue(w)
-        color = "#00F0FF" if w < 600 else "#FFD700" if w < 1000 else "#FF0055"
+        color = "#00F0FF" if w < 500 else "#FFD700" if w < 800 else "#FF0055"
         self.api_bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {color}; }}")
 
-    def update_table(self, data):
-        self.table.setRowCount(len(data))
-        for i, row in enumerate(data):
-            font_main = QFont("Segoe UI", 9, QFont.Weight.Bold)
-            font_num = QFont("Consolas", 9)
+    def update_table_view(self, candidates: list):
+        self.table.setRowCount(0)
+        sorted_candidates = sorted(candidates, key=lambda x: x["probability"], reverse=True)
 
-            # Asset
-            sym = QTableWidgetItem(row['symbol'].replace("USDT", ""))
-            sym.setFont(font_main)
-            sym.setForeground(QColor("#eaecef"))
-            self.table.setItem(i, 0, sym)
+        for row_idx, data in enumerate(sorted_candidates):
+            self.table.insertRow(row_idx)
 
-            # Direction
-            direction = row.get('direction', 'NEUTRAL')
-            dir_item = QTableWidgetItem(direction)
-            dir_item.setFont(font_main)
-            dir_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            if direction == "LONG":
-                dir_item.setForeground(QColor("#0ecb81")) # Green
-            elif direction == "SHORT":
-                dir_item.setForeground(QColor("#f6465d")) # Red
+            prob = data["probability"]
+            if prob >= config.SNIPER_PROBABILITY_THRESHOLD:
+                badge_color = "#00FFFF"  # Cyan Sniper Alpha
+            elif prob >= config.WATCHLIST_PROBABILITY_THRESHOLD:
+                badge_color = "#00FF66"  # Green Momentum
             else:
-                dir_item.setForeground(QColor("#848e9c"))
-            self.table.setItem(i, 1, dir_item)
+                badge_color = "#888888"  # Dark Gray Accumulation
 
-            # Price
-            p_val = f"{row['price']:.4f}" if row['price'] < 10 else f"{row['price']:.2f}"
-            price = QTableWidgetItem(p_val)
-            price.setFont(font_num)
-            price.setForeground(QColor("#b7bdc6"))
-            self.table.setItem(i, 2, price)
+            sym_item = QTableWidgetItem(data["symbol"])
+            sym_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            sym_item.setForeground(QColor("#eaecef"))
 
-            # 24h %
-            pct = row['change']
-            change = QTableWidgetItem(f"{pct:+.2f}%")
-            change.setFont(font_num)
-            c_color = "#0ecb81" if pct > 0 else "#f6465d"
-            change.setForeground(QColor(c_color))
-            self.table.setItem(i, 3, change)
+            price_item = QTableWidgetItem(f"{data['price']:.4f}" if data['price'] < 10 else f"{data['price']:.2f}")
+            price_item.setFont(QFont("Consolas", 9))
+            price_item.setForeground(QColor("#b7bdc6"))
 
-            # Vol (M)
-            vol = QTableWidgetItem(f"{row['vol_m']:.1f}M")
-            vol.setFont(font_num)
-            vol.setForeground(QColor("#848e9c"))
-            self.table.setItem(i, 4, vol)
+            prob_item = QTableWidgetItem(f"{prob:.1f}%")
+            prob_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Black))
+            prob_item.setForeground(QColor(badge_color))
+            prob_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            # Signal/Flags
-            dets = row['details']
-            flags = QTableWidgetItem(dets)
-            flags.setFont(QFont("Segoe UI", 8))
-            if "COILED" in dets:
-                flags.setForeground(QColor("#FF00FF"))
-            elif "VOL_SPIKE" in dets:
-                flags.setForeground(QColor("#00F0FF"))
-            elif "STRONG_BODY" in dets:
-                flags.setForeground(QColor("#0ecb81"))
+            regime_item = QTableWidgetItem(f"{data['oi_regime']} (ΔOI: {data['delta_oi']:+.1f}%)")
+            regime_item.setFont(QFont("Consolas", 8))
+            if "AGG_LONG_INFLOW" in data['oi_regime']:
+                regime_item.setForeground(QColor("#0ecb81"))
+            elif "SHORT_COVERING" in data['oi_regime']:
+                regime_item.setForeground(QColor("#00F0FF"))
             else:
-                flags.setForeground(QColor("#5E6673"))
-            self.table.setItem(i, 5, flags)
+                regime_item.setForeground(QColor("#848e9c"))
 
-            # Score
-            sc = row['score']
-            s_item = QTableWidgetItem(f"{sc:.0f}")
-            s_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            s_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Black))
-            if sc >= 80:
-                s_item.setForeground(QColor("#00F0FF"))
-                s_item.setBackground(QColor(0, 240, 255, 25))
-            elif sc >= 60:
-                s_item.setForeground(QColor("#0ecb81"))
+            alpha_item = QTableWidgetItem(f"α: {data['beta_alpha']:+.2f}% | Z: {data['diurnal_z']:.1f}")
+            alpha_item.setFont(QFont("Consolas", 8))
+            alpha_item.setForeground(QColor("#b7bdc6"))
+
+            flags_item = QTableWidgetItem(" | ".join(data["flags"]))
+            flags_item.setFont(QFont("Segoe UI", 8))
+            if "SQUEEZE_FIRE" in data["flags"]:
+                flags_item.setForeground(QColor("#00FFFF"))
+            elif "COILED" in data["flags"]:
+                flags_item.setForeground(QColor("#FF00FF"))
             else:
-                s_item.setForeground(QColor("#444"))
-            self.table.setItem(i, 6, s_item)
+                flags_item.setForeground(QColor("#848e9c"))
+
+            self.table.setItem(row_idx, 0, sym_item)
+            self.table.setItem(row_idx, 1, price_item)
+            self.table.setItem(row_idx, 2, prob_item)
+            self.table.setItem(row_idx, 3, regime_item)
+            self.table.setItem(row_idx, 4, alpha_item)
+            self.table.setItem(row_idx, 5, flags_item)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -436,8 +406,12 @@ class BreakoutMonitor(QMainWindow):
         e.accept()
 
 
+# Maintain BreakoutMonitor for backward compatibility / alias
+BreakoutMonitor = BreakoutRadarWindow
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    w = BreakoutMonitor()
+    w = BreakoutRadarWindow()
     w.show()
     sys.exit(app.exec())
