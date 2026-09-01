@@ -81,12 +81,14 @@ class BreakoutScoringEngine:
             is_breaking_level=curr_close <= (n_low * 1.002)
         )
 
-        if long_score >= short_score and long_score > 0:
-            return {"symbol": symbol, "score": long_score, "direction": "LONG", "flags": long_flags, "z_score": vol_zscore, "bbw": curr_bbw, "delta_oi": delta_oi}
-        elif short_score > long_score and short_score > 0:
-            return {"symbol": symbol, "score": short_score, "direction": "SHORT", "flags": short_flags, "z_score": vol_zscore, "bbw": curr_bbw, "delta_oi": delta_oi}
+        curr_volume = float(volumes.iloc[-1])
 
-        return {"symbol": symbol, "score": 0, "direction": "NEUTRAL", "flags": [], "z_score": vol_zscore, "bbw": curr_bbw, "delta_oi": delta_oi}
+        if long_score >= short_score and long_score > 0:
+            return {"symbol": symbol, "price": float(curr_close), "volume": curr_volume, "score": long_score, "direction": "LONG", "flags": long_flags, "z_score": vol_zscore, "bbw": curr_bbw, "delta_oi": delta_oi}
+        elif short_score > long_score and short_score > 0:
+            return {"symbol": symbol, "price": float(curr_close), "volume": curr_volume, "score": short_score, "direction": "SHORT", "flags": short_flags, "z_score": vol_zscore, "bbw": curr_bbw, "delta_oi": delta_oi}
+
+        return {"symbol": symbol, "price": float(curr_close), "volume": curr_volume, "score": 0, "direction": "NEUTRAL", "flags": [], "z_score": vol_zscore, "bbw": curr_bbw, "delta_oi": delta_oi}
 
     def _score_direction(self, direction: str, is_compressed: bool, vol_zscore: float, delta_oi: float,
                          c_metrics: Dict[str, float], is_trend_aligned: bool, is_breaking_level: bool) -> tuple[int, list[str]]:
