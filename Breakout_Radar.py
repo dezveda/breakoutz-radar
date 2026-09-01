@@ -147,8 +147,7 @@ class ExchangeWorker(QThread):
 class ModernTitleBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(40)
-        self.setStyleSheet("background-color: #0b0e11; border-bottom: 1px solid #1e2329;")
+        self.parent = parent
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(10, 0, 0, 0)
         self.layout.setSpacing(0)
@@ -175,19 +174,19 @@ class ModernTitleBar(QWidget):
             QPushButton { border: none; background: transparent; color: #888; font-weight: bold; }
             QPushButton:hover { background: #1e2329; color: #fff; }
         """
-        btn_close_style = """
+        close_style = """
             QPushButton { border: none; background: transparent; color: #888; font-weight: bold; }
             QPushButton:hover { background: #ff3333; color: #fff; }
         """
         self.btn_min = QPushButton("—")
         self.btn_min.setFixedSize(40, 30)
         self.btn_min.setStyleSheet(btn_style)
+        self.btn_min.clicked.connect(self.parent.showMinimized)
+
         self.btn_close = QPushButton("✕")
         self.btn_close.setFixedSize(40, 30)
-        self.btn_close.setStyleSheet(btn_close_style)
-
-        self.btn_min.clicked.connect(self.window().showMinimized)
-        self.btn_close.clicked.connect(self.window().close)
+        self.btn_close.setStyleSheet(close_style)
+        self.btn_close.clicked.connect(self.parent.close)
 
         self.layout.addWidget(self.btn_min)
         self.layout.addWidget(self.btn_close)
@@ -195,13 +194,16 @@ class ModernTitleBar(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.start_pos = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
-            event.accept()
+            self.start_pos = event.globalPosition().toPoint()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton and self.start_pos:
-            self.window().move(event.globalPosition().toPoint() - self.start_pos)
-            event.accept()
+        if self.start_pos:
+            delta = event.globalPosition().toPoint() - self.start_pos
+            self.parent.move(self.parent.pos() + delta)
+            self.start_pos = event.globalPosition().toPoint()
+
+    def mouseReleaseEvent(self, event):
+        self.start_pos = None
 
 
 class BreakoutRadarWindow(QMainWindow):
@@ -365,30 +367,28 @@ class BreakoutRadarWindow(QMainWindow):
             if edge:
                 self.resizing = True
                 self.resize_edge = edge
-                event.accept()
+                self.old_pos = event.globalPosition().toPoint()
+
+    def mouseMoveEvent(self, event):
+        if self.resizing:
+            delta = event.globalPosition().toPoint() - self.old_pos
+            self._resize_window(delta)
+            self.old_pos = event.globalPosition().toPoint()
+        else:
+            edge = self._check_edge(event.pos())
+            if edge in ("right", "left"):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif edge in ("bottom", "top"):
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+            elif edge == "bottom_right":
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event):
         self.resizing = False
         self.resize_edge = None
-
-    def mouseMoveEvent(self, event):
-        pos = event.pos()
-        if self.resizing and self.resize_edge:
-            self._do_resize(event.globalPosition().toPoint())
-            event.accept()
-            return
-
-        edge = self._check_edge(pos)
-        if edge in ["bottom_right", "top_left"]:
-            self.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
-        elif edge in ["bottom_left", "top_right"]:
-            self.setCursor(QCursor(Qt.CursorShape.SizeBDiagCursor))
-        elif edge in ["right", "left"]:
-            self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
-        elif edge in ["bottom", "top"]:
-            self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
-        else:
-            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _check_edge(self, pos):
         r = self.rect()
@@ -397,20 +397,19 @@ class BreakoutRadarWindow(QMainWindow):
         if x > w - m and y > h - m: return "bottom_right"
         if x > w - m: return "right"
         if y > h - m: return "bottom"
+        if x < m: return "left"
+        if y < m: return "top"
         return None
 
-    def _do_resize(self, global_pos):
+    def _resize_window(self, delta):
         geo = self.geometry()
-        delta = global_pos - geo.topLeft()
         if self.resize_edge == "right":
-            geo.setWidth(delta.x())
+            geo.setWidth(geo.width() + delta.x())
         elif self.resize_edge == "bottom":
-            geo.setHeight(delta.y())
+            geo.setHeight(geo.height() + delta.y())
         elif self.resize_edge == "bottom_right":
-            geo.setWidth(delta.x())
-            geo.setHeight(delta.y())
-        elif self.resize_edge == "top":
-            geo.setTop(geo.top() + delta.y())
+            geo.setWidth(geo.width() + delta.x())
+            geo.setHeight(geo.height() + delta.y())
         elif self.resize_edge == "left":
             geo.setLeft(geo.left() + delta.x())
         if geo.width() > 300 and geo.height() > 300:
